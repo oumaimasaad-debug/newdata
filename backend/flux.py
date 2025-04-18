@@ -2,16 +2,14 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from gradio_client import Client
 import os
-import tempfile
-import base64
 import time
+import zipfile
 import shutil
-import requests
-from urllib.parse import urlparse
-from pathlib import Path
+import re
 
 app = Flask(__name__)
 
+# Autoriser uniquement le frontend en localhost:3000
 CORS(app, resources={
     r"/llm": {
         "origins": "http://localhost:3000",
@@ -20,74 +18,127 @@ CORS(app, resources={
     }
 })
 
-def generate_image_from_prompt(prompt):
+# Répertoire de base pour stocker les images
+BASE_DIR = r"C:\Users\omaim\Downloads\test\Flux\backend"
+CLASS1_DIR = os.path.join(BASE_DIR, "Dataset")
+
+# Fonction pour nettoyer les noms de fichiers
+def clean_filename(name):
+    invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*', '\n', '\r', '\t']
+    for char in invalid_chars:
+        name = name.replace(char, "_")
+    return name
+
+# Génération de l’image via Gradio
+def generate_image_from_prompt(class_name, prompt, image_id):
     try:
-
-        client = Client("https://52b7cbeeeb47a101eb.gradio.live/")
-
+        client = Client("https://be0e17d61cd7b47078.gradio.live")  # URL du modèle Gradio
         result = client.predict(
-            prompt,  # Use the prompt from the request
-            512,     # width
-            512,     # height
-            0,       # seed
-            20,      # steps
-            "euler", # sampler
-            "normal", # scheduler
-            7.5,     # guidance scale
-            0,       # negative prompt weight
-            0,       # style strength
+            prompt,
+            512,
+            512,
+            0,
+            20,
+            "euler",
+            "normal",
+            7.5,
+            0,
+            0,
             fn_index=0,
             timeout=60
         )
-        
-        print(f"Gradio result: {result}")
-        
-        image_path = result[0]
 
-        temp_dir = tempfile.mkdtemp()
-        local_image_path = os.path.join(temp_dir, f"generated_image_{int(time.time())}.png")
-        if image_path.startswith(('http://', 'https://')):
-            response = requests.get(image_path, stream=True)
-            if response.status_code == 200:
-                with open(local_image_path, 'wb') as f:
-                    for chunk in response.iter_content(1024):
-                        f.write(chunk)
-            else:
-                raise Exception(f"Failed to download image from URL: {response.status_code}")
+        # Chemin temporaire de l'image générée
+        image_path = result  
+        class_name_clean = clean_filename(class_name.upper())
+
+        class_dir = os.path.join(CLASS1_DIR, class_name_clean)
+        os.makedirs(class_dir, exist_ok=True)
+
+        image_name = f"{image_id}.png"
+        local_image_path = os.path.join(class_dir, image_name)
+
+        if os.path.exists(image_path):
+            with open(image_path, "rb") as src, open(local_image_path, 'wb') as dst:
+                dst.write(src.read())
+            return {
+                "success": True,
+                "image_path": local_image_path,
+                "message": f"Image {image_name} saved for prompt: {prompt}"
+            }
         else:
-            try:
-                shutil.copy(image_path, local_image_path)
-            except Exception as copy_error:
-                if os.path.exists(image_path):
-                    with open(image_path, 'rb') as src, open(local_image_path, 'wb') as dst:
-                        dst.write(src.read())
-                else:
-                    raise Exception(f"Cannot access the image at path: {image_path}")
-        with open(local_image_path, "rb") as img_file:
-            img_data = img_file.read()
-            encoded_img = base64.b64encode(img_data).decode('utf-8')
-        try:
-            shutil.rmtree(temp_dir)
-        except:
-            pass
-        
-        return {
-            "success": True,
-            "image": encoded_img,
-            "message": f"Image generated successfully for prompt: {prompt}"
-        }
+            raise FileNotFoundError(f"File not found: {image_path}")
+
     except Exception as e:
-        print(f"Error generating image: {str(e)}")
         return {
             "success": False,
-            "image": None,
-            "message": f"Error generating image: {str(e)}"
+            "image_path": None,
+            "message": str(e)
         }
 
+# Endpoint principal
 @app.route('/llm', methods=['POST', 'OPTIONS'])
 def process_text():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
 
+    data = request.get_json()
+    prompt_text = data.get("prompt", "")
+    if not prompt_text:
+        return jsonify({"success": False, "message": "Prompt is missing"}), 400
+
+    # Nettoyer ancien dossier class1 s’il existe
+    if os.path.exists(CLASS1_DIR):
+        shutil.rmtree(CLASS1_DIR)
+    os.makedirs(CLASS1_DIR)
+
+    # Utiliser regex pour découper correctement les classes
+    class_prompts = re.split(r"\s*,?\s*END\s*,?\s*", prompt_text.strip())
+    results = []
+    image_id = 64  # Compteur d'ID d'image
+
+    for class_prompt in class_prompts:
+        class_prompt = class_prompt.strip()
+        if not class_prompt:
+            continue
+        parts = class_prompt.split("/")
+        if len(parts) < 2:
+            continue
+
+        class_name = parts[0].strip()
+        prompts = [p.strip() for p in parts[1:] if p.strip()]
+
+        for p in prompts:
+            result = generate_image_from_prompt(class_name, p, image_id)
+            image_id += 1
+            results.append(result)
+
+    if not all(r["success"] for r in results):
+        return jsonify({
+            "success": False,
+            "results": results
+        }), 500
+
+    # Créer un zip après génération complète
+    zip_path = os.path.join(BASE_DIR, "generated_images.zip")
+    image_files = []
+
+    for root, _, files in os.walk(CLASS1_DIR):
+        for file in files:
+            abs_path = os.path.join(root, file)
+            image_files.append(abs_path)
+
+    if not image_files:
+        return jsonify({"success": False, "message": "No images generated"}), 500
+
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for file in image_files:
+            zipf.write(file, os.path.relpath(file, BASE_DIR))
+
+    if not os.path.exists(zip_path):
+        return jsonify({"success": False, "message": "ZIP file creation failed"}), 500
+
+    return send_file(zip_path, as_attachment=True, download_name="generated_images.zip")
+
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5000, use_reloader=False)
